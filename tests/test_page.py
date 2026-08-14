@@ -30,6 +30,7 @@ from pypdf.generic import (
     IndirectObject,
     NameObject,
     NullObject,
+    NumberObject,
     RectangleObject,
     TextStringObject,
 )
@@ -1003,6 +1004,71 @@ def test_merge_transformed_page_annotation_with_multi_state_appearance():
     for state in merged_states.values():
         matrix = tuple(round(float(x), 6) for x in state.get_object()["/Matrix"])
         assert matrix == (0.0, 1.0, -1.0, 0.0, 200.0, 0.0)
+
+
+def test_transfer_rotation_to_content_moves_annotations():
+    """
+    Regression test for https://github.com/py-pdf/pypdf/issues/2592 and
+    https://github.com/py-pdf/pypdf/issues/2784: transfer_rotation_to_content
+    used to move the page's content and its MediaBox/CropBox/etc, but left
+    annotations at their original, now-inconsistent /Rect entirely. It
+    routes through add_transformation(), which now transforms annotations
+    (/Rect and appearance /Matrix) the same way merge_transformed_page does.
+    """
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=200, height=100)
+    page[NameObject("/Rotate")] = NumberObject(90)
+
+    ap_stream = DecodedStreamObject()
+    ap_stream.set_data(b"0 0 m 50 20 l S")
+    ap_stream[NameObject("/Type")] = NameObject("/XObject")
+    ap_stream[NameObject("/Subtype")] = NameObject("/Form")
+    ap_stream[NameObject("/BBox")] = ArrayObject(
+        [FloatObject(0), FloatObject(0), FloatObject(50), FloatObject(20)]
+    )
+    ap_ref = writer._add_object(ap_stream)
+
+    annotation = DictionaryObject()
+    annotation[NameObject("/Type")] = NameObject("/Annot")
+    annotation[NameObject("/Subtype")] = NameObject("/Square")
+    annotation[NameObject("/Rect")] = RectangleObject((10, 10, 60, 30))
+    annotation[NameObject("/AP")] = DictionaryObject({NameObject("/N"): ap_ref})
+    writer.add_annotation(0, annotation)
+
+    page.transfer_rotation_to_content()
+
+    assert page.rotation == 0
+    assert tuple(round(float(x), 6) for x in page.mediabox) == (0.0, 0.0, 100.0, 200.0)
+    merged = page["/Annots"][0].get_object()
+    # (10,10)-(60,30) under this method's own rotate-about-center-then-
+    # reposition transform for a 200x100 -> 100x200 page; verified against
+    # the actual transform rather than hand-derived, and cross-checked by
+    # rendering (the annotation's appearance rotates to match, not just
+    # its bounding box -- see the /AP /Matrix assertion below).
+    assert tuple(round(float(x), 6) for x in merged["/Rect"]) == (10.0, 140.0, 30.0, 190.0)
+    ap = merged["/AP"]["/N"].get_object()
+    # The appearance stream must also rotate -- not just the /Rect -- or the
+    # content renders stretched into the new box instead of turned to match.
+    matrix = tuple(round(float(x), 6) for x in ap["/Matrix"])
+    assert matrix != (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def test_page_scale_moves_annotations():
+    """scale() must still move annotation /Rect after routing this logic
+    through add_transformation() instead of its own dedicated loop.
+    """
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    annotation = DictionaryObject()
+    annotation[NameObject("/Type")] = NameObject("/Annot")
+    annotation[NameObject("/Subtype")] = NameObject("/Square")
+    annotation[NameObject("/Rect")] = RectangleObject((20, 20, 120, 70))
+    writer.add_annotation(0, annotation)
+
+    page.scale(0.5, 0.5)
+
+    merged = page["/Annots"][0].get_object()
+    assert tuple(round(float(x), 6) for x in merged["/Rect"]) == (10.0, 10.0, 60.0, 35.0)
 
 
 def test_merge_page_reproducible_with_proc_set():

@@ -65,7 +65,6 @@ from .actions import Action, PageTrigger
 from .constants import (
     _INLINE_IMAGE_KEY_MAPPING,
     _INLINE_IMAGE_VALUE_MAPPING,
-    AnnotationDictionaryAttributes,
     ImageAttributes,
 )
 from .constants import PageAttributes as PG
@@ -1313,6 +1312,83 @@ class PageObject(DictionaryObject):
 
         return None
 
+    @staticmethod
+    def _transform_annotation_appearance(
+        annotation_obj: DictionaryObject, trsf: "Transformation"
+    ) -> None:
+        """
+        Compose `trsf` into an annotation's /AP /N appearance stream(s),
+        in place.
+
+        Repositioning/resizing /Rect alone is not enough: per the
+        appearance-stream algorithm (PDF 2.0, 12.5.5), a viewer fits the
+        appearance's /BBox (as mapped by its own /Matrix) into /Rect using
+        an axis-aligned scale, never a rotation. Left alone, rotating or
+        shearing a page therefore stretches/skews the untouched appearance
+        content into the new, differently-shaped /Rect instead of rotating
+        it. Composing the transform into /Matrix (rather than overwriting
+        it) keeps the rendered content consistent with the rest of the
+        transformed page while preserving whatever the annotation already
+        had. Handles both a single appearance stream and the multi-state
+        /AP /N dict used by checkbox/radio-button widgets.
+        """
+        try:
+            ap = cast(DictionaryObject, annotation_obj["/AP"])
+            normal_ap = ap["/N"].get_object()
+            state_aps = (
+                normal_ap.values()
+                if isinstance(normal_ap, DictionaryObject)
+                and not isinstance(normal_ap, StreamObject)
+                else [normal_ap]
+            )
+            for state_ap in state_aps:
+                state_obj = (
+                    state_ap.get_object()
+                    if isinstance(state_ap, IndirectObject)
+                    else state_ap
+                )
+                if not isinstance(state_obj, StreamObject):
+                    continue
+                old_matrix = tuple(state_obj.get("/Matrix", (1, 0, 0, 1, 0, 0)))
+                state_obj[NameObject("/Matrix")] = ArrayObject(
+                    FloatObject(x)
+                    for x in Transformation(old_matrix).transform(trsf).ctm
+                )
+        except KeyError:
+            pass
+
+    @staticmethod
+    def _transform_annotations_in_place(
+        annotations: "ArrayObject", trsf: "Transformation"
+    ) -> None:
+        """Apply `trsf` to every annotation in `annotations`, in place: /Rect,
+        /QuadPoints (for markup annotations), and appearance stream /Matrix.
+        """
+        for a in annotations:
+            a = a.get_object()
+            if "/Rect" not in a:
+                continue
+            r = cast(ArrayObject, a["/Rect"])
+            pt1 = trsf.apply_on((r[0], r[1]), True)
+            pt2 = trsf.apply_on((r[2], r[3]), True)
+            a[NameObject("/Rect")] = ArrayObject(
+                (
+                    min(pt1[0], pt2[0]),
+                    min(pt1[1], pt2[1]),
+                    max(pt1[0], pt2[0]),
+                    max(pt1[1], pt2[1]),
+                )
+            )
+            if "/QuadPoints" in a:
+                q = cast(ArrayObject, a["/QuadPoints"])
+                a[NameObject("/QuadPoints")] = ArrayObject(
+                    trsf.apply_on((q[0], q[1]), True)
+                    + trsf.apply_on((q[2], q[3]), True)
+                    + trsf.apply_on((q[4], q[5]), True)
+                    + trsf.apply_on((q[6], q[7]), True)
+                )
+            PageObject._transform_annotation_appearance(a, trsf)
+
     def _merge_page_writer(
         self,
         page2: "PageObject",
@@ -1399,43 +1475,10 @@ class PageObject(DictionaryObject):
                         + trsf.apply_on((q[6], q[7]), True)
                     )
                 # The /Rect update above only repositions and resizes the
-                # annotation's bounding box. Per the appearance-stream
-                # algorithm (PDF 2.0, 12.5.5), a viewer fits the appearance's
-                # /BBox (as mapped by its own /Matrix) into /Rect using an
-                # axis-aligned scale, never a rotation. Left alone, rotating
-                # or shearing a page therefore stretches/skews the untouched
-                # appearance content into the new, differently-shaped /Rect
-                # instead of rotating it. Composing our transform into the
-                # appearance's own /Matrix keeps the rendered content
-                # consistent with the rest of the transformed page.
-                try:
-                    ap = cast(DictionaryObject, aa["/AP"])
-                    normal_ap = ap["/N"].get_object()
-                    # /N is a single appearance stream for most annotations,
-                    # but for widgets with multiple states (checkboxes, radio
-                    # buttons) it is instead a dict of named sub-streams, one
-                    # per state. Only a stream carries its own /BBox/Matrix.
-                    state_aps = (
-                        normal_ap.values()
-                        if isinstance(normal_ap, DictionaryObject)
-                        and not isinstance(normal_ap, StreamObject)
-                        else [normal_ap]
-                    )
-                    for state_ap in state_aps:
-                        state_obj = (
-                            state_ap.get_object()
-                            if isinstance(state_ap, IndirectObject)
-                            else state_ap
-                        )
-                        if not isinstance(state_obj, StreamObject):
-                            continue
-                        old_matrix = tuple(state_obj.get("/Matrix", (1, 0, 0, 1, 0, 0)))
-                        state_obj[NameObject("/Matrix")] = ArrayObject(
-                            FloatObject(x)
-                            for x in Transformation(old_matrix).transform(trsf).ctm
-                        )
-                except KeyError:
-                    pass
+                # annotation's bounding box; it does not touch the
+                # appearance stream's own coordinate system. See
+                # _transform_annotation_appearance for why that matters.
+                PageObject._transform_annotation_appearance(aa, trsf)
                 try:
                     aa["/Popup"][NameObject("/Parent")] = aa.indirect_reference
                 except KeyError:
@@ -1652,6 +1695,10 @@ class PageObject(DictionaryObject):
             content = PageObject._add_transformation_matrix(content, self.pdf, ctm)
             content.isolate_graphics_state()
             self.replace_contents(content)
+        if PG.ANNOTS in self:
+            annotations = self[PG.ANNOTS]
+            if isinstance(annotations, ArrayObject):
+                PageObject._transform_annotations_in_place(annotations, Transformation(ctm))
         # if expanding the page to fit a new page, calculate the new media box size
         if expand:
             corners = [
@@ -1697,19 +1744,8 @@ class PageObject(DictionaryObject):
         self.artbox = self.artbox.scale(sx, sy)
         self.cropbox = self.cropbox.scale(sx, sy)
         self.mediabox = self.mediabox.scale(sx, sy)
-
-        if PG.ANNOTS in self:
-            annotations = self[PG.ANNOTS]
-            if isinstance(annotations, ArrayObject):
-                for annotation in annotations:
-                    annotation_obj = annotation.get_object()
-                    if AnnotationDictionaryAttributes.Rect in annotation_obj:
-                        rectangle = annotation_obj[AnnotationDictionaryAttributes.Rect]
-                        if isinstance(rectangle, ArrayObject):
-                            rectangle[0] = FloatObject(float(rectangle[0]) * sx)
-                            rectangle[1] = FloatObject(float(rectangle[1]) * sy)
-                            rectangle[2] = FloatObject(float(rectangle[2]) * sx)
-                            rectangle[3] = FloatObject(float(rectangle[3]) * sy)
+        # Annotations (/Rect, /QuadPoints, appearance stream /Matrix) are
+        # already transformed by add_transformation() above.
 
         if PG.VP in self:
             viewport = self[PG.VP]
